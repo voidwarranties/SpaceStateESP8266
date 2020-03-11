@@ -13,14 +13,18 @@
   https://github.com/esp8266/Arduino
 
   The circuit:
-  * Pin GPIO0 (D1): Internal pullup enabled. Connected to GROUND with a switch (the
-    space state lever in the space). When the circuit is closed, the pin is
+    Pin GPIO0 (D1): Internal pullup enabled. Connected to GROUND with a switch
+    (the space state lever in the space). When the circuit is closed, the pin is
     pulled low and Voidwarranties is considered open. When the circuit is
     opened, the pin is pulled high by the internal pullup and
     Voidwarranties is considered closed.
-  * Pin GPIO2 (D2): DHT22 temperature and humidity sensor.
+    Pin GPIO2 (D2): DHT22 temperature and humidity sensor.
 
   Created 22nd of June 2016
+  Updated 4th of December 2019 to push temperature and humidity to MQTT
+  Updated 11th of March 2020 to use mDNS to reach the MQTT server, publish the
+  space state to the MQTT server, separate configuration file support and a
+  general code cleanup.
   By Michael Smith
   http://we.voidwarranties.be/
   This software is licensed under MIT.
@@ -30,96 +34,160 @@
 #include <Arduino.h>
 #include <DHT.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
 #include <ESP8266HTTPClient.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+#include "config.h"
 
-// Flags
-boolean serialDebug = false;
+// WiFi config
+char ssid[] = WLANSSID;
+char password[] = WLANPWD;
 
-// Variables
-char ssid[] = "WIFI_SSID";           // SSID of WiFi network to connect to
-char password[] = "";                         // Passphrase of WiFi network
+// MQTT config
+char mqtt_server[] = MQTT_SERVER;
+int mqtt_port = MQTT_PORT;
+char mqtt_user[] = MQTT_USER;
+char mqtt_password[] = MQTT_PASSWORD;
 
-// URL of the space API endpoint:
-char space_api_url[] = "SPACE_STATE_API_ENDPOINT";
-// URL of the Thingspeak API endpoint:
-char thingspeak_api_url[] = "http://api.thingspeak.com/update";
-// Thingspeak channel write API key:
-const char* apiKey = "THINGSPEAK_API_KEY";
+// Space State API config
+char space_api_url[] = SPACE_API_URL;
 
-int switchPin = D1;                     // Digital pin used to form circuit
-                                        // to ground
-int DHTpin = D2;                        // Digital pin to which the DHT22
-                                        // sensor is connected
-int updateDelay = 60000;                // Interval between updates on space
-                                        // state (60000 = 60s)
+// Hardware config
+int switchPin = STATE_SWITCH_PIN;
+int DHTpin = DHT_PIN;
+int updateDelay = UPDATE_DELAY;
+
+int spaceState = 0;
 
 // Objects
 DHT dht(DHTpin, DHT22);
 
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, mqtt_server, mqtt_port, mqtt_user,
+                          mqtt_password);
+Adafruit_MQTT_Publish dhtFeed = Adafruit_MQTT_Publish(&mqtt, MQTT_TOPIC);
+
+// Function to connect and reconnect as necessary to the MQTT server.
+// Should be called in the loop function and it will take care if connecting.
+void MQTT_connect() {
+  int8_t ret;
+
+  // Stop if already connected.
+  if (mqtt.connected()) {
+    return;
+  }
+
+  Serial.print(F("Connecting to MQTT... "));
+
+  uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) {
+    Serial.println(mqtt.connectErrorString(ret));
+    Serial.println(F("Retrying MQTT connection in 5 seconds..."));
+    mqtt.disconnect();
+    delay(5000);
+    retries--;
+    if (retries == 0) {
+      return;
+    }
+  }
+  Serial.println(F("MQTT Connected!"));
+}
+
 void setup() {
-  if (serialDebug) Serial.begin(9600);
+  Serial.begin(9600);
   pinMode(switchPin, INPUT_PULLUP);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
   WiFi.begin(ssid, password);
+
+  // Wait for connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(F("."));
+  }
+  Serial.println("");
+  Serial.print(F("Connected to "));
+  Serial.println(ssid);
+  Serial.print(F("IP address: "));
+  Serial.println(WiFi.localIP());
+
+  // Set up mDNS responder
+  if (!MDNS.begin(F("spacestate"))) {
+    Serial.println(F("Error setting up MDNS responder!"));
+    while (1) {
+      delay(1000);
+    }
+  }
+  Serial.println(F("mDNS responder started"));
+
   dht.begin();
 }
 
 void loop() {
-  Serial.println("Ready.");
+  MDNS.update();
+
   // Read temperature and humidity from DHT22 sensor
   // Reading temperature or humidity takes about 250 milliseconds!
   // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+
   // Read humidity
   float h = dht.readHumidity();
   // Read temperature
   float t = dht.readTemperature();
 
   // Wait for WiFi connection:
-  if(WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED) {
     // Set up HTTP request:
     HTTPClient http;
     http.begin(space_api_url);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.addHeader(F("Content-Type"), F("application/x-www-form-urlencoded"));
 
     // Check if space is closed (circuit open):
     if (digitalRead(switchPin) == HIGH) {
-      if (serialDebug) Serial.println("Space closed");
-      http.POST("state=closed");
-    // Check if space is open (circuit closed):
+      spaceState = 0;
+      Serial.println(F("Space closed"));
+      http.POST(F("state=closed"));
+      // Check if space is open (circuit closed):
     } else {
-      if (serialDebug) Serial.println("Space open");
-      http.POST("state=open");
+      spaceState = 1;
+      Serial.println(F("Space open"));
+      http.POST(F("state=open"));
     }
     http.end();
 
-    // Report temperature and humidity to thingspeak
+    // Report temperature and humidity to MQTT
     if (isnan(h) || isnan(t)) {
-      if (serialDebug) Serial.println("Failed to read from DHT sensor!");
+      Serial.println(F("Failed to read from DHT sensor!"));
     } else {
-      http.begin(thingspeak_api_url);
-      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-      http.addHeader("X-THINGSPEAKAPIKEY", apiKey);
-      String postStr = apiKey;
-             postStr +="&field1=";
-             postStr += String(t);
-             postStr +="&field2=";
-             postStr += String(h);
-      http.POST(postStr);
-      http.end();
+      // Push to MQTT
+      MQTT_connect();
+      char mqtt_buffer[200];
+      snprintf(mqtt_buffer,
+               200,
+               "{\"temperature\": %.2f,\"humidity\": %.2f,\"state\": %d}",
+               t,
+               h,
+               spaceState);
 
-      if (serialDebug) {
-        Serial.print("Humidity: ");
-        Serial.print(h);
-        Serial.print(" %\t");
-        Serial.print("Temperature: ");
-        Serial.print(t);
-        Serial.println(" *C ");
+      Serial.println(F("\nSending iaq data:"));
+      Serial.println(mqtt_buffer);
+      Serial.print(F("..."));
+      if (! dhtFeed.publish(mqtt_buffer)) {
+        Serial.println(F("Failed"));
+      } else {
+        Serial.println(F("OK!"));
       }
+
+      Serial.print(F("Humidity: "));
+      Serial.print(h);
+      Serial.print(F(" %\t"));
+      Serial.print(F("Temperature: "));
+      Serial.print(t);
+      Serial.println(F(" *C "));
     }
   }
 
-  // Wait a while before the next update
   delay(updateDelay);
 }
